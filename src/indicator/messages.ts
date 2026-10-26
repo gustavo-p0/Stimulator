@@ -4,6 +4,8 @@ export const MESSAGES = {
   Close: "Close",
   Hide: "Hide",
   Show: "Show",
+  Ready: "Ready",
+  Unavailable: "Unavailable",
   showShowButton: "showShowButton",
   HideShowButton: "HideShowButton",
   Empty: "",

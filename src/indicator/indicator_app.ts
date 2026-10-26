@@ -9,11 +9,15 @@ import * as Gtk from "@sigmasd/gtk/gtk3";
 import {
   ioAddWatch,
   IOCondition,
+  timeout,
+  sourceRemove,
   UnixSignal,
   unixSignalAdd,
 } from "@sigmasd/gtk/glib";
 import { APP_ID, UI_LABELS } from "../consts.ts";
 import { MESSAGES } from "./messages.ts";
+import { LineProtocol } from "../indicator-line-protocol.ts";
+import { TrayHeartbeat } from "../tray-heartbeat.ts";
 
 // since this app is used with ipc, this is a better name
 const sendMsg = console.log;
@@ -47,54 +51,67 @@ if (import.meta.main) {
     },
   );
 
-  let first_try = true;
+  let readinessCheck: number | undefined;
+  const cancelReadinessCheck = () => {
+    if (readinessCheck !== undefined) {
+      sourceRemove(readinessCheck);
+      readinessCheck = undefined;
+    }
+  };
+  const awaitTrayConnection = () => {
+    cancelReadinessCheck();
+    const heartbeat = new TrayHeartbeat(20);
+    const check = () => {
+      const pulse = heartbeat.observe(Boolean(indicator.props.connected));
+      if (pulse.message) sendMsg(pulse.message);
+      if (!pulse.continuePolling) {
+        readinessCheck = undefined;
+        Gtk.mainQuit();
+      }
+      return pulse.continuePolling;
+    };
+    if (check()) readinessCheck = timeout(250, check);
+  };
+  const lines = new LineProtocol();
   ioAddWatch(
     0, /*stdin*/
     IOCondition.IN,
     () => {
       const buf = new Uint8Array(512);
       const n = Deno.stdin.readSync(buf);
-      if (!n) throw new Error("recieved an empty message");
-
-      const message = new TextDecoder()
-        .decode(buf.slice(0, n))
-        .trim();
-      switch (message) {
-        case MESSAGES.Activate:
-          indicator.setStatus(IndicatorStatus.ACTIVE);
-          // NOTE: if thhe indicator is not connected after being set to active, this means the system doesn't support tray icons, so exit
-          if (!indicator.props.connected) {
-            // The icon might take some time to be active (happens in kde)
-            // Give it one more chance
-            if (!first_try) {
-              // The user will recive this error in the logs:
-              // `(.:11550): Gtk-CRITICAL **: 05:57:05.429: gtk_widget_get_scale_factor: assertion 'GTK_IS_WIDGET (widget)' failed`
-              // becuase they don't have tray icon support, its harmless though
-              Gtk.mainQuit();
-            } else {
-              first_try = false;
-            }
-          }
-          break;
-        case MESSAGES.Deactivate:
-          indicator.setStatus(IndicatorStatus.PASSIVE);
-          break;
-        case MESSAGES.Hide:
-          indicator.setStatus(IndicatorStatus.PASSIVE);
-          break;
-        case MESSAGES.Close:
-          Gtk.mainQuit();
-          break;
-        case MESSAGES.showShowButton:
-          showApp.show();
-          break;
-        case MESSAGES.HideShowButton:
-          showApp.hide();
-          break;
-        default:
-          throw new Error(`Incorrect message: '${message}'`);
+      if (n === null || n === 0) {
+        cancelReadinessCheck();
+        Gtk.mainQuit();
+        return false;
       }
-
+      for (const message of lines.push(buf.subarray(0, n))) {
+        switch (message) {
+          case MESSAGES.Activate:
+            indicator.setStatus(IndicatorStatus.ACTIVE);
+            awaitTrayConnection();
+            break;
+          case MESSAGES.Deactivate:
+            cancelReadinessCheck();
+            indicator.setStatus(IndicatorStatus.PASSIVE);
+            break;
+          case MESSAGES.Hide:
+            cancelReadinessCheck();
+            indicator.setStatus(IndicatorStatus.PASSIVE);
+            break;
+          case MESSAGES.Close:
+            cancelReadinessCheck();
+            Gtk.mainQuit();
+            break;
+          case MESSAGES.showShowButton:
+            showApp.show();
+            break;
+          case MESSAGES.HideShowButton:
+            showApp.hide();
+            break;
+          default:
+            throw new Error(`Incorrect message: '${message}'`);
+        }
+      }
       return true;
     },
   );

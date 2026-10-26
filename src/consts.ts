@@ -21,6 +21,12 @@ export class EN_UI_LABELS {
   static Light: string;
   static Dark: string;
   static "Behavior on Closing": string;
+  static "Start Minimized": string;
+  static "Requires Run in Background and active suspension inhibition": string;
+  static "Enable suspension inhibition first": string;
+  static "Connecting to system tray": string;
+  static "System tray unavailable": string;
+  static "Start without opening the window": string;
   static "Applies only while active": string;
   static "Ask Confirmation": string;
   static "Run in Background": string;

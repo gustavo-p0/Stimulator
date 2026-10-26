@@ -5,15 +5,21 @@ import {
 } from "@sigmasd/gtk/gio";
 import type { MainWindow } from "../main.ts";
 import { MESSAGES } from "./messages.ts";
+import type { TrayAvailability } from "../startup-coordinator.ts";
+import { LineProtocol } from "../indicator-line-protocol.ts";
+import { IndicatorCommandQueue } from "../indicator-command-queue.ts";
 
 export class Indicator {
-  #encoder = new TextEncoder();
   #io_priority = 0;
   #stdin;
   #mainWindow: MainWindow;
+  #availability: TrayAvailability = "pending";
+  #availabilityListener?: (availability: TrayAvailability) => void;
+  #commands: IndicatorCommandQueue;
+  #child: Subprocess;
   constructor(mainWindow: MainWindow) {
     this.#mainWindow = mainWindow;
-    const child = new Subprocess(
+    this.#child = new Subprocess(
       [
         "deno",
         "run",
@@ -23,17 +29,35 @@ export class Indicator {
       ],
       SubprocessFlags.STDIN_PIPE | SubprocessFlags.STDOUT_PIPE,
     );
-    this.#stdin = child.getStdinPipe()!;
-    this.#monitorStdout(child.getStdoutPipe()!);
+    this.#stdin = this.#child.getStdinPipe()!;
+    this.#commands = new IndicatorCommandQueue(
+      (data, done) => this.#stdin.writeAllAsync(data, this.#io_priority, done),
+      () => this.#setAvailability("unavailable"),
+    );
+    this.#monitorStdout(this.#child.getStdoutPipe()!);
   }
 
+  get availability(): TrayAvailability {
+    return this.#availability;
+  }
+  setAvailabilityListener(listener: (availability: TrayAvailability) => void) {
+    this.#availabilityListener = listener;
+    listener(this.#availability);
+  }
+  #setAvailability(availability: TrayAvailability) {
+    this.#availability = availability;
+    this.#availabilityListener?.(availability);
+  }
   activate() {
+    this.#setAvailability("pending");
     this.#writeToStdin(MESSAGES.Activate);
   }
   deactivate() {
+    this.#setAvailability("unavailable");
     this.#writeToStdin(MESSAGES.Deactivate);
   }
   hide() {
+    this.#setAvailability("unavailable");
     this.#writeToStdin(MESSAGES.Hide);
   }
   close() {
@@ -47,41 +71,43 @@ export class Indicator {
   }
 
   #writeToStdin(message: string) {
-    this.#stdin.writeAllAsync(
-      this.#encoder.encode(message),
-      this.#io_priority,
-    );
+    this.#commands.send(message);
+  }
+
+  stop() {
+    this.#child.forceExit();
   }
 
   #monitorStdout(stdoutPipe: InputStream) {
-    const decoder = new TextDecoder();
+    const lines = new LineProtocol();
+    const handleMessage = (message: string) => {
+      switch (message) {
+        case MESSAGES.Ready:
+          this.#setAvailability("ready");
+          break;
+        case MESSAGES.Unavailable:
+          this.#setAvailability("unavailable");
+          break;
+        case MESSAGES.Show:
+          this.#mainWindow.present();
+          break;
+        case MESSAGES.Close:
+          this.#mainWindow.quit();
+          break;
+        default:
+          throw new Error(`Incorrect message: '${message}'`);
+      }
+    };
     const readNext = () => {
-      stdoutPipe.readBytesAsync(
-        512, /*buffer size*/
-        0, /*priority*/
-        (data) => {
-          const message = data && data.length > 0
-            ? decoder.decode(data).trim()
-            : MESSAGES.Empty;
-
-          switch (message) {
-            case MESSAGES.Show:
-              this.#mainWindow.present();
-              break;
-            case MESSAGES.Close:
-              this.#mainWindow.quit();
-              break;
-            case MESSAGES.Empty:
-              // NOTE: the indicator have exited
-              // the only reason for this currently is if the system doesn't support tray icons, so we stop polling data
-              return;
-            default:
-              throw new Error(`Incorrect message: '${message}'`);
-          }
-
-          readNext();
-        },
-      );
+      stdoutPipe.readBytesAsync(512, 0, (data) => {
+        if (!data || data.length === 0) {
+          // The tray process exited: recover any background window.
+          this.#setAvailability("unavailable");
+          return;
+        }
+        for (const message of lines.push(data)) handleMessage(message);
+        readNext();
+      });
     };
     readNext();
   }

@@ -46,6 +46,8 @@ import { APP_ID, APP_NAME, UI_LABELS, VERSION } from "./consts.ts";
 import { Indicator } from "./indicator/indicator_api.ts";
 import { PreferencesMenu, type Theme } from "./pref-win.ts";
 import type { Behavior } from "./pref-win.ts";
+import { StartupCoordinator, type TrayAvailability } from "./startup-coordinator.ts";
+import { parseStartupArguments } from "./startup-args.ts";
 
 import stimulatorUi from "./ui/stimulator.ui" with { type: "text" };
 import shortcutsUi from "./ui/shortcuts.ui" with { type: "text" };
@@ -68,6 +70,7 @@ interface State {
   idle: boolean | "active_disabled";
   themeV2: Theme;
   exitBehaviorV2: Behavior;
+  startMinimized: boolean;
   suspendTimer: TimerDuration;
   idleTimer: TimerDuration;
   version: number;
@@ -81,6 +84,8 @@ export class MainWindow {
   #idleRow: SwitchRow;
   #preferencesMenu: PreferencesMenu;
   #indicator?: Indicator;
+  #hiddenInBackground = false;
+  #onIndicatorAvailabilityChanged?: (availability: TrayAvailability) => void;
   #screenSaverProxy: DBusProxy | null;
   #suspendTimerId?: number;
   #idleTimerId?: number;
@@ -95,6 +100,23 @@ export class MainWindow {
   }
   set indicator(value) {
     this.#indicator = value;
+    value?.setAvailabilityListener((availability) => {
+      this.#preferencesMenu?.refreshStartMinimized();
+      if (availability === "unavailable" && this.#hiddenInBackground) {
+        this.present();
+      }
+      this.#onIndicatorAvailabilityChanged?.(availability);
+    });
+    this.#preferencesMenu?.refreshStartMinimized();
+  }
+  get suspensionInhibited() {
+    return Boolean(this.#cookies.suspend);
+  }
+  onIndicatorAvailabilityChanged(callback: (availability: TrayAvailability) => void) {
+    this.#onIndicatorAvailabilityChanged = callback;
+  }
+  refreshStartMinimizedPreference() {
+    this.#preferencesMenu?.refreshStartMinimized();
   }
 
   #state: State = {
@@ -104,6 +126,7 @@ export class MainWindow {
     idle: false,
     themeV2: "System Theme",
     exitBehaviorV2: "Ask Confirmation",
+    startMinimized: false,
     suspendTimer: "Never",
     idleTimer: "Never",
     version: 1,
@@ -128,7 +151,7 @@ export class MainWindow {
     StyleManager.getDefault().setColorScheme(currentTheme);
 
     if (this.#state.exitBehaviorV2 === "Run in Background") {
-      this.#indicator = new Indicator(this);
+      this.indicator = new Indicator(this);
     }
 
     // NOTE: This is used for kde (and other DEs that behave the same, since its still using a freedesktop standard)
@@ -221,12 +244,35 @@ export class MainWindow {
   }
 
   present() {
+    this.#hiddenInBackground = false;
     this.#win.present();
+    this.#indicator?.hideShowButton();
+  }
+
+  hideInBackground() {
+    if (this.#hiddenInBackground) return;
+    this.#hiddenInBackground = true;
+    this.#win.setVisible(false);
+    this.#indicator?.showShowButton();
+    const notification = new Notification(UI_LABELS.Stimulator);
+    notification.setBody(
+      UI_LABELS["Stimulator is running in the background"],
+    );
+    timeoutSeconds(
+      1,
+      () => {
+        this.#app.withdrawNotification(APP_ID);
+        return false;
+      },
+    );
+    this.#app.sendNotification(APP_ID, notification);
   }
 
   updateState(state: Partial<State>) {
     this.#state = { ...this.#state, ...state };
     localStorage.setItem("state", JSON.stringify(this.#state));
+    this.refreshStartMinimizedPreference();
+    this.#onIndicatorAvailabilityChanged?.(this.#indicator?.availability ?? "unavailable");
 
     // If timer duration changed while active, restart the timer
     if (
@@ -259,23 +305,10 @@ export class MainWindow {
     // if tray icon is active and suspend button is active, go to the background instead of exiting
     if (
       this.#state.exitBehaviorV2 === "Run in Background" &&
-      this.#state.suspend
+      this.suspensionInhibited &&
+      this.#indicator?.availability === "ready"
     ) {
-      this.#win.setVisible(false);
-      this.#indicator?.showShowButton();
-      // inform user via notification
-      const notification = new Notification(UI_LABELS.Stimulator);
-      notification.setBody(
-        UI_LABELS["Stimulator is running in the background"],
-      );
-      timeoutSeconds(
-        1,
-        () => {
-          this.#app.withdrawNotification(APP_ID);
-          return false;
-        },
-      );
-      this.#app.sendNotification(APP_ID, notification);
+      this.hideInBackground();
       return true;
     }
 
@@ -729,12 +762,36 @@ export class MainWindow {
 
 if (import.meta.main) {
   const app = new Application(APP_ID, ApplicationFlags.NONE);
+  const startupArgs = parseStartupArguments(Deno.args);
   let win: MainWindow | undefined;
+  const startup = new StartupCoordinator({
+    prerequisites: () => ({
+      startMinimized: win?.state.startMinimized ?? false,
+      backgroundEnabled: win?.state.exitBehaviorV2 === "Run in Background",
+      suspensionInhibited: win?.suspensionInhibited ?? false,
+      tray: win?.indicator?.availability ?? "unavailable",
+    }),
+    showWindow: () => {
+      win?.present();
+      app.withdrawNotification(APP_ID);
+    },
+    hideWindow: () => win?.hideInBackground(),
+    scheduleFallback: (onTimeout) => {
+      let pending = true;
+      const id = timeoutSeconds(5, () => {
+        pending = false;
+        onTimeout();
+        return false;
+      });
+      return () => {
+        if (pending) sourceRemove(id);
+        pending = false;
+      };
+    },
+  });
+
   app.onActivate(() => {
-    // NOTE: there could be already an active window
-    // if the app is restored after being hidden on exit
     if (!win) {
-      // css needs the display which is only available after the app started
       const cssProvider = new CssProvider();
       cssProvider.loadFromData(mainCss);
       const display = Display.getDefault();
@@ -746,19 +803,18 @@ if (import.meta.main) {
         );
       }
       win = new MainWindow(app);
+      win.onIndicatorAvailabilityChanged(() => startup.onPrerequisitesChanged());
     }
-
-    win.present();
-    win.indicator?.hideShowButton();
-    // withdraw any active notification
-    app.withdrawNotification(APP_ID);
+    startup.activate(startupArgs.requestMinimized);
   });
   unixSignalAdd(
     UnixSignal.SIGINT,
     () => {
+      startup.dispose();
       app.quit();
       return true;
     },
   );
-  app.run(Deno.args);
+  app.onShutdown(() => win?.indicator?.stop());
+  app.run(startupArgs.gtkArgs);
 }

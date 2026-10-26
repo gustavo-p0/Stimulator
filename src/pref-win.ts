@@ -2,12 +2,15 @@ import {
   ColorScheme,
   getComboRow,
   getPreferencesWindow,
+  getSwitchRow,
   type PreferencesWindow,
   StyleManager,
+  type SwitchRow,
 } from "@sigmasd/gtk/adw";
 import { Builder, StringList, type Window } from "@sigmasd/gtk/gtk4";
 import { timeout } from "@sigmasd/gtk/glib";
 import { UI_LABELS } from "./consts.ts";
+import { getStartMinimizedPreference } from "./startup-policy.ts";
 import { Indicator } from "./indicator/indicator_api.ts";
 import type { MainWindow, TimerDuration } from "./main.ts";
 
@@ -18,8 +21,11 @@ export type Behavior = "Ask Confirmation" | "Run in Background" | "Quit";
 
 export class PreferencesMenu {
   #preferencesWin: PreferencesWindow;
+  #startMinimizedRow?: SwitchRow;
+  #mainWindow: MainWindow;
 
   constructor(mainWindow: MainWindow) {
+    this.#mainWindow = mainWindow;
     const builder = new Builder();
     builder.addFromString(preferencesUi);
 
@@ -103,6 +109,15 @@ export class PreferencesMenu {
       },
     );
 
+    const startMinimizedRow = getSwitchRow(builder, "startMinimizedRow")!;
+    this.#startMinimizedRow = startMinimizedRow;
+    startMinimizedRow.setTitle(UI_LABELS["Start Minimized"]);
+    startMinimizedRow.setActive(mainWindow.state.startMinimized);
+    startMinimizedRow.onActiveChanged((active) => {
+      mainWindow.updateState({ startMinimized: active });
+    });
+    this.refreshStartMinimized();
+
     const suspendTimer = getComboRow(builder, "suspendTimer")!;
     const timerOptions = [
       "5",
@@ -153,6 +168,28 @@ export class PreferencesMenu {
         mainWindow.updateState({ idleTimer: duration });
       },
     );
+  }
+
+  refreshStartMinimized() {
+    const row = this.#startMinimizedRow;
+    if (!row) return;
+    const mainWindow = this.#mainWindow;
+    const disposition = getStartMinimizedPreference({
+      backgroundEnabled: mainWindow.state.exitBehaviorV2 === "Run in Background",
+      suspensionInhibited: mainWindow.suspensionInhibited,
+      tray: mainWindow.indicator?.availability ?? "unavailable",
+    });
+    row.setVisible(disposition.visible);
+    row.setSensitive(disposition.enabled);
+
+    const subtitle = disposition.reason === "suspension-required"
+      ? UI_LABELS["Enable suspension inhibition first"]
+      : disposition.reason === "tray-connecting"
+      ? UI_LABELS["Connecting to system tray"]
+      : disposition.reason === "tray-unavailable"
+      ? UI_LABELS["System tray unavailable"]
+      : UI_LABELS["Start without opening the window"];
+    row.setSubtitle(subtitle);
   }
 
   set_transient_for(window: Window) {
